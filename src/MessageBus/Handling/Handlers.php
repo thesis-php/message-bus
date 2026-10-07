@@ -54,7 +54,6 @@ final class Handlers implements HandlerRegistry
         }
 
         $copy = clone $this;
-        /** @phpstan-ignore assign.propertyType */
         $copy->handlers[$messageClass][$qualifier] = $handler;
 
         return $copy;
