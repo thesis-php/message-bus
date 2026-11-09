@@ -63,13 +63,29 @@ final readonly class PgmqTransport implements TransactionalDispatcher, Receiver,
         // Consumers are woken up by pgmq_dispatch_v1() itself (see below), not by pgmq's insert trigger. The trigger
         // updates the queue's row in pgmq.notify_insert_throttle on every insert, and that row lock is held until the
         // sender commits: concurrent senders to one queue wait for each other, and two transactions sending to two
-        // queues in opposite order deadlock. Drop it if an earlier version set it up. The check reads the catalog only;
-        // the DDL (and its table lock) runs once per queue, under the lock pgmq takes to create and drop queues.
+        // queues in opposite order deadlock. Undo an earlier setup, without stalling a live queue:
+        //
+        // * the throttle row goes first: without it the trigger updates nothing and locks nothing. Deleting it waits
+        //   only for senders holding that row, not for the whole table;
+        // * the trigger itself is dropped with a short lock_timeout: DROP TRIGGER takes an ACCESS EXCLUSIVE lock that
+        //   waits for every open transaction on the queue and blocks its readers and senders meanwhile. If the queue is
+        //   busy, it is skipped with a warning; the trigger is harmless without its row, and the next setup retries.
+        //
+        // Both steps only read the catalog when there is nothing to undo, so repeated setups run no DDL.
         $this->postgres->query(\sprintf(
             <<<'SQL'
-                DO $disable$
+                DO $undo$
+                DECLARE
+                    v_queue text := %s;
+                    v_lock_timeout text := current_setting('lock_timeout');
                 BEGIN
-                    PERFORM pgmq.acquire_queue_lock(%1$s);
+                    PERFORM set_config('lock_timeout', '2s', true);
+
+                    BEGIN
+                        DELETE FROM pgmq.notify_insert_throttle WHERE queue_name = v_queue;
+                    EXCEPTION WHEN lock_not_available THEN
+                        RAISE WARNING 'pgmq queue "%%" is busy: its insert-notify throttle row is left for the next setup', v_queue;
+                    END;
 
                     IF EXISTS (
                         SELECT 1
@@ -77,15 +93,19 @@ final readonly class PgmqTransport implements TransactionalDispatcher, Receiver,
                         JOIN pg_class c ON c.oid = tg.tgrelid
                         JOIN pg_namespace n ON n.oid = c.relnamespace
                         WHERE n.nspname = 'pgmq'
-                          AND c.relname = pgmq.format_table_name(%1$s, 'q')
+                          AND c.relname = pgmq.format_table_name(v_queue, 'q')
                           AND tg.tgname = 'trigger_notify_queue_insert_listeners'
-                    ) OR EXISTS (
-                        SELECT 1 FROM pgmq.notify_insert_throttle t WHERE t.queue_name = %1$s
                     ) THEN
-                        PERFORM pgmq.disable_notify_insert(%1$s);
+                        BEGIN
+                            PERFORM pgmq.disable_notify_insert(v_queue);
+                        EXCEPTION WHEN lock_not_available THEN
+                            RAISE WARNING 'pgmq queue "%%" is busy: its insert-notify trigger is left for the next setup', v_queue;
+                        END;
                     END IF;
+
+                    PERFORM set_config('lock_timeout', v_lock_timeout, true);
                 END
-                $disable$
+                $undo$
                 SQL,
             $this->postgres->quoteLiteral($name),
         ));
@@ -239,8 +259,9 @@ final readonly class PgmqTransport implements TransactionalDispatcher, Receiver,
             $timeoutWatcher,
             new ChannelWatcher(
                 $polls,
-                // pgmq_dispatch_v1() notifies this channel; see createQueue() for why the insert trigger is not used.
-                $this->postgres->listen(Pgmq\channelName($queue->name)),
+                // pgmq_dispatch_v1() notifies this channel; see createQueue() for why the insert trigger is not used. Lower case:
+                // the SQL side names the channel after the queue table, and pgmq lower-cases table names.
+                $this->postgres->listen(Pgmq\channelName(strtolower($queue->name))),
                 $timeoutWatcher,
             ),
         ]);
