@@ -196,7 +196,7 @@ final readonly class PgmqTransport implements TransactionalDispatcher, Receiver,
 
         $iterator = $polls->iterate();
 
-        EventLoop::queue(function () use ($queue, $handler, $completion, $watcher, $iterator): void {
+        EventLoop::queue(function () use ($queue, $handler, $completion, $watcher, $iterator, $polls): void {
             $watcher->watch();
 
             try {
@@ -237,6 +237,12 @@ final readonly class PgmqTransport implements TransactionalDispatcher, Receiver,
                         }
                     } finally {
                         EventLoop::cancel($updateVisibilityId);
+                    }
+
+                    // A full batch means the queue may hold more messages. Inserts that already happened will not
+                    // notify again, so waiting for the next signal would leave the backlog idle for up to $pollInterval.
+                    if (\count($messages) === $this->batchSize && !$polls->isComplete()) {
+                        $polls->pushAsync(null)->ignore();
                     }
                 }
 
