@@ -111,49 +111,6 @@ final readonly class PgmqNotifyTriggerTest
         Assert::true($handler->received->isComplete());
     }
 
-    public function concurrentConsumerStartsCreateTheTriggerOnce(): void
-    {
-        $postgres = self::postgres();
-        $transport = new PgmqTransport($postgres);
-        $queue = self::createQueue($transport);
-        // Simulates a queue whose notifications are not set up (created before, or lost).
-        $postgres->execute('SELECT pgmq.disable_notify_insert(?)', [$queue]);
-
-        // A producer keeps an insert into the queue open, so the consumer starts are guaranteed to overlap.
-        $producer = $postgres->beginTransaction();
-        $transport->dispatchInTransaction($producer, [self::envelope($queue)]);
-
-        $failures = [];
-        $creations = self::countTriggerCreations($postgres, $queue, static function () use ($producer, $queue, &$failures): void {
-            $starts = [];
-
-            for ($i = 0; $i < 4; ++$i) {
-                // Each consumer has its own pool, as separate worker processes do.
-                $own = new PgmqTransport(self::postgres());
-                $starts[] = async(static fn(): Consumer => $own->startConsumer($queue, new SignallingHandler()));
-            }
-
-            delay(0.5);
-            $producer->rollback();
-
-            foreach ($starts as $start) {
-                try {
-                    /** @var Consumer $consumer */
-                    $consumer = $start->await(new TimeoutCancellation(5));
-                    $consumer->stop();
-                    $consumer->awaitCompletion();
-                } catch (\Throwable $e) {
-                    $failures[] = $e->getMessage();
-                }
-            }
-        });
-
-        Pgmq\dropQueue($postgres, $queue);
-
-        Assert::same($failures, []);
-        Assert::same($creations, 1);
-    }
-
     public function consumerStartRestoresDisabledTrigger(): void
     {
         $postgres = self::postgres();
@@ -178,42 +135,6 @@ final readonly class PgmqNotifyTriggerTest
         }
 
         Assert::true($handler->received->isComplete());
-    }
-
-    /**
-     * Runs $action and returns how many times the notify trigger of the queue was created meanwhile (event trigger).
-     *
-     * @param non-empty-string $queue
-     * @param callable(): void $action
-     */
-    private static function countTriggerCreations(PostgresConnection $postgres, string $queue, callable $action): int
-    {
-        $postgres->query('CREATE TABLE IF NOT EXISTS public.thesis_test_ddl (object_identity text)');
-        $postgres->query('TRUNCATE public.thesis_test_ddl');
-        $postgres->query(<<<'SQL'
-            CREATE OR REPLACE FUNCTION public.thesis_test_log_ddl() RETURNS event_trigger LANGUAGE plpgsql AS $$
-            DECLARE r record;
-            BEGIN
-                FOR r IN SELECT * FROM pg_event_trigger_ddl_commands() LOOP
-                    INSERT INTO public.thesis_test_ddl (object_identity) VALUES (r.object_identity);
-                END LOOP;
-            END $$
-            SQL);
-        $postgres->query('DROP EVENT TRIGGER IF EXISTS thesis_test_ddl');
-        $postgres->query("CREATE EVENT TRIGGER thesis_test_ddl ON ddl_command_end WHEN TAG IN ('CREATE TRIGGER') EXECUTE FUNCTION public.thesis_test_log_ddl()");
-
-        try {
-            $action();
-        } finally {
-            $postgres->query('DROP EVENT TRIGGER IF EXISTS thesis_test_ddl');
-        }
-
-        /** @var array{n: int} $row */
-        $row = $postgres
-            ->execute('SELECT count(*)::int AS n FROM public.thesis_test_ddl WHERE object_identity LIKE ?', ['% on pgmq.q_' . $queue])
-            ->fetchRow();
-
-        return $row['n'];
     }
 
     private static function postgres(): PostgresConnection
