@@ -6,8 +6,22 @@ services:
     environment:
       IN_CONTAINER: true
       HISTFILE: /workspace/var/.docker_history
+      THESIS_PGMQ_DSN: host=pgmq user=postgres password=postgres
     volumes:
       - .:/workspace
       - ~/.composer/cache:/composer/cache
     tty: true
     init: true
+    depends_on:
+      pgmq:
+        condition: service_healthy
+
+  pgmq:
+    image: ghcr.io/pgmq/pg18-pgmq:v1.11.1
+    environment:
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
